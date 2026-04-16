@@ -4,7 +4,7 @@
   "stage1_block0": "int4",
   "stage1_block1": "int8",
   "stage2_block0": "int4",
-  "stage2_block1": "int8",
+  "stage2_block1": "int4",
   "stage2_block2": "int4",
   "stage2_block3": "int4",
   "stage2_block4": "int4",

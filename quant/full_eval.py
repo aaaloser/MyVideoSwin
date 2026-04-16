@@ -7,20 +7,23 @@ full test set through the model.
 
 Quantisation strategy
 ---------------------
-INT8 Block:
-  - Weight: per-output-channel fake-quant all 4 Linear layers
-  - Activation: fake-quant attn_windows output of forward_part1
+INT8 Block (W8A8):
+  - Weight: real INT8 storage via RealQuantLinear (4× memory reduction).
+            Dequantised to FP32 on-the-fly inside each forward().
+  - Activation: per-tensor fake-quant (simulate INT8 precision)
   - Error carry: e_block = fp32_out - int8_out, forwarded to next same-stage block
 
-INT4 Block (W4A16 — weight-only quantisation):
-  - Weight: per-output-channel fake-quant (INT4)
+INT4 Block (W4A16):
+  - Weight: real INT4 nibble-packed storage via RealQuantLinear (8× memory reduction).
+            Dequantised to FP32 on-the-fly inside each forward().
   - Activation: FP32 (no activation quantisation)
-  - No carry, no anchor — activations flow through unchanged.
-  - At Stage boundaries, INT8 carry is reset.
+  - No carry — activations flow through unchanged.
 
-Note on DDP: the patches are applied before wrapping in DDP, so they are
-visible to all ranks. carry/anchor state is local to each rank (each rank
-processes its own batch slice), which is correct.
+Memory savings: every Linear weight is stored as int8/uint8 instead of float32.
+The temporary FP32 weight tensor is created for each matmul and immediately freed.
+
+Note on DDP: patches and linear replacements are applied after DDP wrapping via
+model.module.backbone. carry state is local to each rank (correct for inference).
 """
 
 from typing import Dict, Optional
@@ -31,8 +34,7 @@ import torch.nn.functional as F
 
 from .utils import (
     symmetric_fake_quant,
-    apply_fake_quant_weight_inplace,
-    restore_weight_inplace,
+    replace_linear_real_quant,
 )
 from .calibrate import _disable_checkpoint, _restore_checkpoint
 
@@ -72,19 +74,18 @@ def inject_full_eval(
     verbose: bool = True,
 ):
     """
-    Monkey-patch every SwinTransformerBlock3D.forward() to inject:
-      1. Per-block weight fake quantisation
-      2. Activation fake quantisation
-      3. Error forwarding (INT8 carry) / Residual reuse (INT4 anchor)
+    For every SwinTransformerBlock3D:
+      1. Replace its 4 nn.Linear layers with RealQuantLinear (real int storage).
+         FP32 weights are freed immediately; memory drops 4–8× per block.
+      2. Patch block.forward() for INT8 activation fake-quant + carry.
+    Also patches BasicLayer.forward() for carry propagation.
 
-    Also patches BasicLayer.forward() to reset carry/anchor at Stage entry.
-
-    Call remove_full_eval() to undo all patches.
+    Call remove_full_eval() to remove forward patches.
+    Note: linear replacements are permanent (weights remain as int storage).
     """
     backbone = model.module.backbone if hasattr(model, 'module') else model.backbone
     _disable_checkpoint(backbone)
 
-    n_stages = len(backbone.layers)
     depths = [len(layer.blocks) for layer in backbone.layers]
 
     for s_idx, layer in enumerate(backbone.layers):
@@ -93,7 +94,10 @@ def inject_full_eval(
             bits = _get_bits(block_bits, s_idx, b_idx)
             lam = calib_stats.get('block_stats', {}).get((s_idx, b_idx), {}).get('lambda', 0.3)
 
-            # Attach mutable state
+            # Replace Linear weights with real int storage (frees FP32 immediately)
+            _replace_block_linears(blk, bits)
+
+            # Attach mutable carry state
             blk._qstate = _BlockQuantState()
             blk._ptq_bits = bits
             blk._ptq_lambda = lam
@@ -105,11 +109,15 @@ def inject_full_eval(
 
         _patch_layer_forward(layer, s_idx, verbose)
 
+    # Free any lingering FP32 weight tensors
+    torch.cuda.empty_cache()
+
     if verbose:
         total = sum(depths)
         n8 = sum(1 for v in block_bits.values() if v == 'int8')
         n4 = sum(1 for v in block_bits.values() if v == 'int4')
-        print(f'[FullEval] Patched {total} blocks: {n8}×INT8, {n4}×INT4')
+        print(f'[RealQuant] Replaced {total} blocks: {n8}×INT8, {n4}×INT4 '
+              f'(weights now integer-stored)')
 
 
 def _patch_block_forward(blk):
@@ -131,12 +139,12 @@ def _patch_block_forward(blk):
 
         if bits == 8:
             # ---- W8A8 ----
-            _apply_weights(blk, 8)
+            # Weights already stored as INT8 in RealQuantLinear;
+            # dequantisation to FP32 happens inside each linear.forward().
             shortcut = x
             x_attn = blk.forward_part1(x, mask_matrix)
             x = shortcut + blk.drop_path(x_attn)
             x = x + blk.forward_part2(x)
-            _restore_weights(blk)
 
             # Activation INT8 fake-quant + error carry
             x_sim = symmetric_fake_quant(x, 8, per_channel=False)
@@ -144,14 +152,13 @@ def _patch_block_forward(blk):
             return x_sim
 
         else:
-            # ---- W4A16: weight-only INT4, activations stay FP32 ----
-            _apply_weights(blk, 4)
+            # ---- W4A16 ----
+            # Weights stored as INT4 packed in RealQuantLinear;
+            # activations remain FP32, no carry.
             shortcut = x
             x_attn = blk.forward_part1(x, mask_matrix)
             x = shortcut + blk.drop_path(x_attn)
             x = x + blk.forward_part2(x)
-            _restore_weights(blk)
-            # No activation quant, no carry
             return x
 
     blk.forward = _quant_forward
@@ -209,18 +216,23 @@ def _patch_layer_forward(layer, s_idx: int, verbose: bool):
 
 
 # ---------------------------------------------------------------------------
-# Weight helpers
+# Linear replacement helpers
 # ---------------------------------------------------------------------------
 
-def _apply_weights(blk, bits: int):
-    """In-place per-channel weight fake-quant for all Linear in block."""
-    for l in [blk.attn.qkv, blk.attn.proj, blk.mlp.fc1, blk.mlp.fc2]:
-        apply_fake_quant_weight_inplace(l, bits)
-
-
-def _restore_weights(blk):
-    for l in [blk.attn.qkv, blk.attn.proj, blk.mlp.fc1, blk.mlp.fc2]:
-        restore_weight_inplace(l)
+def _replace_block_linears(blk, bits: int):
+    """
+    Replace the 4 nn.Linear layers in a block with RealQuantLinear.
+    The old FP32 Linear objects are deleted so their weight tensors can be
+    freed from GPU memory (torch.cuda.empty_cache() flushes the allocator).
+    """
+    for parent_name, attr_name in [
+        ('attn', 'qkv'), ('attn', 'proj'), ('mlp', 'fc1'), ('mlp', 'fc2')
+    ]:
+        parent = getattr(blk, parent_name)
+        old_linear = getattr(parent, attr_name)
+        new_linear = replace_linear_real_quant(old_linear, bits)
+        setattr(parent, attr_name, new_linear)
+        del old_linear
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +240,11 @@ def _restore_weights(blk):
 # ---------------------------------------------------------------------------
 
 def remove_full_eval(model: nn.Module):
-    """Remove all PTQ patches from the model, restoring original forward()."""
+    """
+    Remove forward-patch overrides (carry logic, activation fake-quant).
+    Linear layers are NOT restored — they remain as RealQuantLinear with
+    integer-stored weights (intentional: call save_quantized_model after this).
+    """
     backbone = model.module.backbone if hasattr(model, 'module') else model.backbone
 
     for layer in backbone.layers:
@@ -236,7 +252,6 @@ def remove_full_eval(model: nn.Module):
             if getattr(blk, '_ptq_block_patched', False):
                 blk.forward = blk._original_block_forward
                 blk._ptq_block_patched = False
-                _restore_weights(blk)   # safety: ensure fp32 weights
                 if hasattr(blk, '_qstate'):
                     del blk._qstate
 
@@ -245,3 +260,31 @@ def remove_full_eval(model: nn.Module):
             layer._ptq_layer_patched = False
 
     _restore_checkpoint(backbone)
+
+
+# ---------------------------------------------------------------------------
+# Save quantised model
+# ---------------------------------------------------------------------------
+
+def save_quantized_model(model: nn.Module, block_bits: Dict, save_path: str):
+    """
+    Save the quantised model to disk.
+
+    Saved file contains:
+      'state_dict' — model state dict with RealQuantLinear buffers
+                     (weight_q: int8/uint8, scale: float32) instead of
+                     the original float32 .weight parameters.
+      'block_bits' — per-block bit-width config dict.
+
+    To reload: reconstruct the model structure with RealQuantLinear in place,
+    then load the state dict.
+    """
+    import os
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    payload = {
+        'state_dict': model.state_dict(),
+        'block_bits': block_bits,
+    }
+    torch.save(payload, save_path)
+    size_mb = os.path.getsize(save_path) / 1024 / 1024
+    print(f'[RealQuant] Saved quantised model → {save_path}  ({size_mb:.1f} MB)')

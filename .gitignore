@@ -132,3 +132,12 @@ work_dirs/
 # avoid soft links created by MIM
 mmaction/configs/*
 mmaction/tools/*
+
+# PTQ4ViT
+ptq4vit/
+
+# FIMA-Q
+fimaq/
+
+# output
+output_pt/

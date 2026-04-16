@@ -50,7 +50,8 @@ try:
 except (ImportError, ModuleNotFoundError):
     from mmaction.apis import multi_gpu_test, single_gpu_test
 
-from quant import calibrate, quick_eval, inject_full_eval, remove_full_eval
+from quant import calibrate, quick_eval, inject_full_eval, remove_full_eval, save_quantized_model
+from quant.ptq4vit import inject_ptq4vit, remove_ptq4vit, set_ptq4vit_mode
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +93,59 @@ def parse_args():
                         help='Skip quick_eval and load existing block_bits.json')
     parser.add_argument('--high-ratio-threshold', type=float, default=0.30,
                         help='Fraction of windows above τ to assign INT8 (Phase 3)')
+    parser.add_argument('--save-quant-model', default=None, metavar='PATH',
+                        help='Save real-quantised model to this path after evaluation '
+                             '(e.g. output_pt/model_quantized.pth)')
+
+    # ── PTQ4ViT arguments ──────────────────────────────────────────────────
+    parser.add_argument('--ptq4vit', action='store_true',
+                        help='Use PTQ4ViT (hessian-guided) instead of custom PTQ pipeline')
+    parser.add_argument('--ptq4vit-w-bit', type=int, default=8,
+                        help='Linear weight bit-width for PTQ4ViT (default: 8)')
+    parser.add_argument('--ptq4vit-a-bit', type=int, default=8,
+                        help='Linear activation bit-width for PTQ4ViT (default: 8)')
+    parser.add_argument('--ptq4vit-A-bit', type=int, default=8,
+                        help='MatMul A operand bit-width for PTQ4ViT (default: 8)')
+    parser.add_argument('--ptq4vit-B-bit', type=int, default=8,
+                        help='MatMul B operand bit-width for PTQ4ViT (default: 8)')
+    parser.add_argument('--ptq4vit-calib-batches', type=int, default=32,
+                        help='Calibration batches for PTQ4ViT (default: 32)')
+    parser.add_argument('--ptq4vit-intervals-path',
+                        default='output_pt/ptq4vit_intervals.pkl',
+                        help='Path to save/load PTQ4ViT calibrated intervals')
+    parser.add_argument('--ptq4vit-load-intervals', action='store_true',
+                        help='Skip calibration and load existing intervals pkl')
+
+    # ── FIMA-Q arguments ───────────────────────────────────────────────────
+    parser.add_argument('--fimaq', action='store_true',
+                        help='Use FIMA-Q (Fisher IMA, CVPR 2025) PTQ pipeline')
+    parser.add_argument('--fimaq-w-bit', type=int, default=4,
+                        help='Weight bit-width for FIMA-Q (default: 4)')
+    parser.add_argument('--fimaq-a-bit', type=int, default=4,
+                        help='Activation bit-width for FIMA-Q (default: 4)')
+    parser.add_argument('--fimaq-calib-size', type=int, default=32,
+                        help='Number of video samples for FIMA-Q calibration (default: 32)')
+    parser.add_argument('--fimaq-calib-batch-size', type=int, default=4,
+                        help='Batch size during FIMA-Q calibration/optimization (default: 4)')
+    parser.add_argument('--fimaq-calib-metric', default='mse',
+                        choices=['mse', 'mae'],
+                        help='Scale-search metric for FIMA-Q calibration (default: mse)')
+    parser.add_argument('--fimaq-optim-metric', default='fisher_dplr',
+                        choices=['mse', 'mae', 'fisher_brecq',
+                                 'fisher_lr', 'fisher_diag', 'fisher_dplr'],
+                        help='Reconstruction loss for FIMA-Q block optimization (default: fisher_dplr)')
+    parser.add_argument('--fimaq-skip-optim', action='store_true',
+                        help='Run calibration only, skip block reconstruction')
+    parser.add_argument('--fimaq-calib-checkpoint',
+                        default='output_pt/fimaq_calib.pth',
+                        help='Path to save/load FIMA-Q calibration checkpoint')
+    parser.add_argument('--fimaq-load-calib', action='store_true',
+                        help='Skip calibration and load existing FIMA-Q calib checkpoint')
+    parser.add_argument('--fimaq-optim-checkpoint',
+                        default='output_pt/fimaq_optim.pth',
+                        help='Path to save/load FIMA-Q optimization checkpoint')
+    parser.add_argument('--fimaq-load-optim', action='store_true',
+                        help='Skip optimization and load existing FIMA-Q optim checkpoint')
 
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
@@ -154,7 +208,8 @@ def main():
     # ---- distributed init ----
     distributed = args.launcher != 'none'
     if distributed:
-        init_dist(args.launcher, backend='nccl')
+        from datetime import timedelta
+        init_dist(args.launcher, backend='nccl', timeout=timedelta(hours=3))
     rank, world_size = get_dist_info()
 
     # ---- build dataset / dataloader ----
@@ -177,7 +232,7 @@ def main():
     # ---- build model ----
     model = build_model_from_cfg(args, cfg)
 
-    if not args.ptq:
+    if not args.ptq and not args.ptq4vit and not args.fimaq:
         # ---- Standard FP32 test (fallback) ----
         if not distributed:
             model = MMDataParallel(model, device_ids=[0])
@@ -189,7 +244,7 @@ def main():
                 broadcast_buffers=False)
             outputs = multi_gpu_test(model, data_loader,
                                      args.tmpdir, args.gpu_collect)
-    else:
+    elif args.ptq:
         # ---- PTQ pipeline ----
         # Wrap model for single/multi GPU before PTQ phases
         if not distributed:
@@ -237,12 +292,12 @@ def main():
                 verbose=(rank == 0),
             )
 
-        # Phase 4: Full Evaluation with fake quantisation
+        # Phase 4: Full Evaluation with real integer weight quantisation
         if rank == 0:
-            print('[PTQ] === Phase 4: Full Evaluation (Fake Quant) ===')
+            print('[PTQ] === Phase 4: Full Evaluation (Real Int Quant) ===')
             n8 = sum(1 for v in block_bits.values() if v == 'int8')
             n4 = sum(1 for v in block_bits.values() if v == 'int4')
-            print(f'[PTQ] Block allocation: {n8}×INT8, {n4}×INT4')
+            print(f'[PTQ] Block allocation: {n8}×INT8 (W8A8), {n4}×INT4 (W4A16)')
 
         inject_full_eval(model, block_bits, calib_stats, verbose=(rank == 0))
 
@@ -253,6 +308,83 @@ def main():
                                      args.tmpdir, args.gpu_collect)
 
         remove_full_eval(model)
+
+        # Optionally save quantised model (rank 0 only)
+        if args.save_quant_model and rank == 0:
+            save_quantized_model(model, block_bits, args.save_quant_model)
+
+    elif args.ptq4vit:
+        # ---- PTQ4ViT pipeline ----
+        if not distributed:
+            model = MMDataParallel(model, device_ids=[0])
+        else:
+            model = MMDistributedDataParallel(
+                model.cuda(),
+                device_ids=[torch.cuda.current_device()],
+                broadcast_buffers=False)
+        model.eval()
+
+        if rank == 0:
+            print('[PTQ4ViT] === PTQ4ViT Hessian Calibration ===')
+            print(f'[PTQ4ViT] W{args.ptq4vit_w_bit}A{args.ptq4vit_a_bit} '
+                  f'MatMul A{args.ptq4vit_A_bit}B{args.ptq4vit_B_bit}')
+
+        load_path = (args.ptq4vit_intervals_path
+                     if args.ptq4vit_load_intervals else None)
+
+        wrapped_modules = inject_ptq4vit(
+            model=model,
+            calib_loader=data_loader,
+            n_calib_batches=args.ptq4vit_calib_batches,
+            w_bit=args.ptq4vit_w_bit,
+            a_bit=args.ptq4vit_a_bit,
+            A_bit=args.ptq4vit_A_bit,
+            B_bit=args.ptq4vit_B_bit,
+            save_path=args.ptq4vit_intervals_path,
+            load_path=load_path,
+            verbose=(rank == 0),
+        )
+
+        if rank == 0:
+            print('[PTQ4ViT] === Full Evaluation ===')
+
+        if not distributed:
+            outputs = single_gpu_test(model, data_loader)
+        else:
+            outputs = multi_gpu_test(model, data_loader,
+                                     args.tmpdir, args.gpu_collect)
+
+        remove_ptq4vit(model, wrapped_modules)
+
+    elif args.fimaq:
+        # ---- FIMA-Q pipeline ----
+        from quant.fimaq import inject_fimaq, remove_fimaq
+
+        if not distributed:
+            model = MMDataParallel(model, device_ids=[0])
+        else:
+            model = MMDistributedDataParallel(
+                model.cuda(),
+                device_ids=[torch.cuda.current_device()],
+                broadcast_buffers=False)
+        model.eval()
+
+        if rank == 0:
+            print(f'[FIMA-Q] W{args.fimaq_w_bit}A{args.fimaq_a_bit} '
+                  f'metric={args.fimaq_optim_metric}')
+
+        inject_fimaq(model, data_loader, args)
+
+        if rank == 0:
+            print('[FIMA-Q] === Full Evaluation ===')
+
+        if not distributed:
+            outputs = single_gpu_test(model, data_loader)
+        else:
+            outputs = multi_gpu_test(model, data_loader,
+                                     args.tmpdir, args.gpu_collect)
+
+        remove_fimaq(model)
 
     # ---- Evaluation ----
     if rank == 0:
