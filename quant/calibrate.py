@@ -67,7 +67,14 @@ def _build_attn_mask(blk, D, H, W, device):
     return compute_mask(Dp, Hp, Wp, window_size, shift_size, device)
 
 
-def _estimate_lambda(blk, x_in_cpu, device):
+def _estimate_lambda(
+    blk,
+    x_in_cpu,
+    device,
+    lambda_ratio_scale=1.0,
+    lambda_min=0.1,
+    lambda_max=0.5,
+):
     """Two forward_part1 passes (FP32 vs INT8) on a single CPU-stored sample."""
     x = x_in_cpu.to(device)
     _, D, H, W, _ = x.shape
@@ -88,7 +95,10 @@ def _estimate_lambda(blk, x_in_cpu, device):
 
     mse = (fp32_out - int8_out).pow(2).mean().item()
     ref = fp32_out.pow(2).mean().item() + EPS
-    return float(np.clip(math.exp(-mse / ref), 0.1, 0.5))
+    ratio = mse / ref
+    raw = math.exp(-lambda_ratio_scale * ratio)
+    lam = float(np.clip(raw, lambda_min, lambda_max))
+    return lam, ratio, raw
 
 
 # ---------------------------------------------------------------------------
@@ -138,8 +148,16 @@ def calibrate(
     alpha=ALPHA,
     beta=BETA,
     tau_percentile=TAU_PERCENTILE,
+    lambda_ratio_scale=1.0,
+    lambda_min=0.1,
+    lambda_max=0.5,
     verbose=True,
 ):
+    if lambda_ratio_scale <= 0:
+        raise ValueError('lambda_ratio_scale must be > 0')
+    if lambda_min > lambda_max:
+        raise ValueError('lambda_min must be <= lambda_max')
+
     model.eval()
     backbone = model.module.backbone if hasattr(model, 'module') else model.backbone
     device = next(backbone.parameters()).device
@@ -167,7 +185,14 @@ def calibrate(
 
     if verbose:
         print('[Calibrate] Computing per-stage statistics ...')
-    calib_stats = {'block_stats': {}}
+    calib_stats = {
+        'block_stats': {},
+        'lambda_cfg': {
+            'ratio_scale': float(lambda_ratio_scale),
+            'clip_min': float(lambda_min),
+            'clip_max': float(lambda_max),
+        },
+    }
 
     for s_idx in range(n_stages):
         layer = backbone.layers[s_idx]
@@ -225,15 +250,30 @@ def calibrate(
             if x_in_cpu is None:
                 continue
             try:
-                lam = _estimate_lambda(blk, x_in_cpu, device)
+                lam, ratio, raw = _estimate_lambda(
+                    blk,
+                    x_in_cpu,
+                    device,
+                    lambda_ratio_scale=lambda_ratio_scale,
+                    lambda_min=lambda_min,
+                    lambda_max=lambda_max,
+                )
             except Exception:
                 lam = 0.3
+                ratio = None
+                raw = None
             if (s_idx, b_idx) in calib_stats['block_stats']:
                 calib_stats['block_stats'][(s_idx, b_idx)]['lambda'] = lam
             if s_idx in calib_stats:
                 calib_stats[s_idx]['lambda_per_block'][b_idx] = lam
             if verbose:
-                print(f'    Stage {s_idx} Block {b_idx}: lambda={lam:.4f}')
+                if ratio is None:
+                    print(f'    Stage {s_idx} Block {b_idx}: lambda={lam:.4f} (fallback)')
+                else:
+                    print(
+                        f'    Stage {s_idx} Block {b_idx}: '
+                        f'ratio={ratio:.3e} raw={raw:.4f} lambda={lam:.4f}'
+                    )
 
     clear_all_calib_state(backbone)
 

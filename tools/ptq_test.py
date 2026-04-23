@@ -25,10 +25,12 @@ Pass --load-bits   to skip quick_eval and load existing block_bits.json.
 """
 
 import argparse
+import datetime
 import json
 import os
 import os.path as osp
 import pickle
+import re
 import sys
 import warnings
 
@@ -93,6 +95,21 @@ def parse_args():
                         help='Skip quick_eval and load existing block_bits.json')
     parser.add_argument('--high-ratio-threshold', type=float, default=0.30,
                         help='Fraction of windows above τ to assign INT8 (Phase 3)')
+    parser.add_argument('--lambda-ratio-scale', type=float, default=1.0,
+                        help='Scale in lambda=exp(-scale*mse/ref) during calibration '
+                            '(Phase 2, default: 1.0)')
+    parser.add_argument('--lambda-min', type=float, default=0.1,
+                        help='Lower clip bound for lambda (Phase 2, default: 0.1)')
+    parser.add_argument('--lambda-max', type=float, default=0.5,
+                        help='Upper clip bound for lambda (Phase 2, default: 0.5)')
+    parser.add_argument('--no-force-int8-last-in-stage', action='store_true',
+                        help='Disable default INT8 assignment for the last block in each stage')
+    parser.add_argument('--force-int8-blocks', nargs='*', default=[],
+                        help='Explicit block keys forced to INT8 '
+                            '(e.g. stage2_block10 stage2_block14)')
+    parser.add_argument('--force-int4-blocks', nargs='*', default=[],
+                        help='Explicit block keys forced to INT4 '
+                            '(e.g. stage1_block1 stage2_block3)')
     parser.add_argument('--save-quant-model', default=None, metavar='PATH',
                         help='Save real-quantised model to this path after evaluation '
                              '(e.g. output_pt/model_quantized.pth)')
@@ -165,6 +182,24 @@ def turn_off_pretrained(cfg):
             turn_off_pretrained(sub_cfg)
 
 
+_BLOCK_KEY_RE = re.compile(r'^stage\d+_block\d+$')
+
+
+def _normalize_block_key_list(keys, arg_name):
+    normalized = set()
+    for key in keys or []:
+        item = str(key).strip()
+        if not item:
+            continue
+        if not _BLOCK_KEY_RE.match(item):
+            raise ValueError(
+                f'Invalid block key "{item}" in {arg_name}; '
+                'expected format: stage<idx>_block<idx>'
+            )
+        normalized.add(item)
+    return normalized
+
+
 def build_model_from_cfg(args, cfg):
     if args.average_clips is not None:
         if cfg.model.get('test_cfg') is None and cfg.get('test_cfg') is None:
@@ -181,6 +216,59 @@ def build_model_from_cfg(args, cfg):
         register_module_hooks(model, cfg.module_hooks)
     load_checkpoint(model, args.checkpoint, map_location='cpu')
     return model
+
+
+# ---------------------------------------------------------------------------
+# Auto-logging helpers
+# ---------------------------------------------------------------------------
+
+class _Tee:
+    """Simultaneously write to a file and the original stream."""
+    def __init__(self, stream, fh):
+        self._stream = stream
+        self._fh = fh
+    def write(self, data):
+        self._stream.write(data)
+        self._fh.write(data)
+    def flush(self):
+        self._stream.flush()
+        self._fh.flush()
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _build_log_path(args):
+    """Derive a descriptive log filename from the run arguments."""
+    if args.ptq:
+        method = 'ptq'
+        tag = f'calib{args.calib_batches}'
+        if (args.lambda_ratio_scale != 1.0 or
+                args.lambda_min != 0.1 or
+                args.lambda_max != 0.5):
+            tag += (f'_lamS{args.lambda_ratio_scale:g}'
+                    f'_lam{args.lambda_min:g}-{args.lambda_max:g}')
+        if args.no_force_int8_last_in_stage:
+            tag += '_noTail8'
+        if args.force_int8_blocks:
+            tag += f'_f8{len(args.force_int8_blocks)}'
+        if args.force_int4_blocks:
+            tag += f'_f4{len(args.force_int4_blocks)}'
+    elif args.ptq4vit:
+        method = 'ptq4vit'
+        tag = f'w{args.ptq4vit_w_bit}a{args.ptq4vit_a_bit}_calib{args.ptq4vit_calib_batches}'
+    elif args.fimaq:
+        method = 'fimaq'
+        tag = f'w{args.fimaq_w_bit}a{args.fimaq_a_bit}_calib{args.fimaq_calib_size}'
+        if args.fimaq_load_calib:
+            tag += '_load'
+        if args.fimaq_skip_optim:
+            tag += '_skipopt'
+    else:
+        method = 'fp32'
+        tag = 'baseline'
+    ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    os.makedirs('logs', exist_ok=True)
+    return os.path.join('logs', f'{method}_{tag}_{ts}.log')
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +299,14 @@ def main():
         from datetime import timedelta
         init_dist(args.launcher, backend='nccl', timeout=timedelta(hours=3))
     rank, world_size = get_dist_info()
+
+    # ---- auto log file (rank 0 only) ----
+    if rank == 0:
+        log_path = _build_log_path(args)
+        _log_fh = open(log_path, 'w', buffering=1)
+        sys.stdout = _Tee(sys.__stdout__, _log_fh)
+        sys.stderr = _Tee(sys.__stderr__, _log_fh)
+        print(f'[ptq_test] Log → {log_path}', flush=True)
 
     # ---- build dataset / dataloader ----
     # Replicate the exact logic from tools/test.py so that
@@ -256,6 +352,18 @@ def main():
                 broadcast_buffers=False)
         model.eval()
 
+        force_int8_blocks = _normalize_block_key_list(
+            args.force_int8_blocks, '--force-int8-blocks')
+        force_int4_blocks = _normalize_block_key_list(
+            args.force_int4_blocks, '--force-int4-blocks')
+        overlap = force_int8_blocks & force_int4_blocks
+        if overlap:
+            overlap_str = ', '.join(sorted(overlap))
+            raise ValueError(
+                'Blocks cannot be forced to both INT8 and INT4: '
+                f'{overlap_str}'
+            )
+
         # Phase 2: Calibration
         if args.load_calib and osp.exists(args.calib_stats_path):
             if rank == 0:
@@ -265,11 +373,17 @@ def main():
         else:
             if rank == 0:
                 print('[PTQ] === Phase 2: Calibration ===')
+                print('[PTQ] Lambda cfg: '
+                      f'scale={args.lambda_ratio_scale:g}, '
+                      f'clip=[{args.lambda_min:g}, {args.lambda_max:g}]')
             calib_stats = calibrate(
                 model=model,
                 calib_loader=data_loader,
                 n_calib_batches=args.calib_batches,
                 save_path=args.calib_stats_path,
+                lambda_ratio_scale=args.lambda_ratio_scale,
+                lambda_min=args.lambda_min,
+                lambda_max=args.lambda_max,
                 verbose=(rank == 0),
             )
 
@@ -282,6 +396,14 @@ def main():
         else:
             if rank == 0:
                 print('[PTQ] === Phase 3: Quick Evaluation ===')
+                if (args.no_force_int8_last_in_stage or
+                        force_int8_blocks or force_int4_blocks):
+                    print(
+                        '[PTQ] Bit override cfg: '
+                        f'force_tail_int8={not args.no_force_int8_last_in_stage}, '
+                        f'force_int8={len(force_int8_blocks)}, '
+                        f'force_int4={len(force_int4_blocks)}'
+                    )
             block_bits = quick_eval(
                 model=model,
                 mini_loader=data_loader,
@@ -289,6 +411,9 @@ def main():
                 n_eval_batches=args.quick_batches,
                 save_path=args.block_bits_path,
                 high_ratio_threshold=args.high_ratio_threshold,
+                force_int8_last_in_stage=(not args.no_force_int8_last_in_stage),
+                force_int8_blocks=force_int8_blocks,
+                force_int4_blocks=force_int4_blocks,
                 verbose=(rank == 0),
             )
 

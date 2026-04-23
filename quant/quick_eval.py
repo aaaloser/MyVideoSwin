@@ -38,12 +38,18 @@ def quick_eval(
     n_eval_batches=50,
     save_path='output_pt/block_bits.json',
     high_ratio_threshold=HIGH_RATIO_THRESHOLD,
+    force_int8_last_in_stage=FORCE_INT8_LAST_IN_STAGE,
+    force_int8_blocks=None,
+    force_int4_blocks=None,
     verbose=True,
 ):
     """
     Compute per-block window gate trigger rate and assign bit-widths.
     """
     model.eval()
+    force_int8_blocks = set(force_int8_blocks or [])
+    force_int4_blocks = set(force_int4_blocks or [])
+
     backbone = model.module.backbone if hasattr(model, 'module') else model.backbone
     device = next(backbone.parameters()).device
     _disable_checkpoint(backbone)
@@ -112,15 +118,22 @@ def quick_eval(
             total = counts['total']
             high  = counts['high']
             ratio = high / total if total > 0 else 0.0
-
-            is_last = FORCE_INT8_LAST_IN_STAGE and (b_idx == n_blocks - 1)
-            bits = 'int8' if (ratio >= high_ratio_threshold or is_last) else 'int4'
             key = f'stage{s_idx}_block{b_idx}'
+
+            is_last = force_int8_last_in_stage and (b_idx == n_blocks - 1)
+            if key in force_int8_blocks:
+                bits = 'int8'
+                reason = ' (forced INT8 by args)'
+            elif key in force_int4_blocks:
+                bits = 'int4'
+                reason = ' (forced INT4 by args)'
+            else:
+                bits = 'int8' if (ratio >= high_ratio_threshold or is_last) else 'int4'
+                reason = ' (forced INT8 tail)' if is_last else ''
             block_bits[key] = bits
 
             if verbose:
-                flag = ' (forced INT8)' if is_last else ''
-                print(f'  {key}: high_ratio={ratio:.3f} -> {bits}{flag}')
+                print(f'  {key}: high_ratio={ratio:.3f} -> {bits}{reason}')
 
     os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
     with open(save_path, 'w') as f:
